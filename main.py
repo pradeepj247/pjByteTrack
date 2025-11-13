@@ -1,9 +1,11 @@
 import warnings
-
 import cv2
-import numpy
+import numpy as np
 import torch
+import time
+import argparse
 
+from ultralytics import YOLO
 from nets import nn
 from utils import util
 
@@ -15,114 +17,117 @@ def draw_line(image, x1, y1, x2, y2, index):
     h = 10
     color = (200, 0, 0)
     cv2.rectangle(image, (x1, y1), (x2, y2), (0, 200, 0), 2)
-    # Top left corner
+
+    # Top left
     cv2.line(image, (x1, y1), (x1 + w, y1), color, 3)
     cv2.line(image, (x1, y1), (x1, y1 + h), color, 3)
 
-    # Top right corner
+    # Top right
     cv2.line(image, (x2, y1), (x2 - w, y1), color, 3)
     cv2.line(image, (x2, y1), (x2, y1 + h), color, 3)
 
-    # Bottom right corner
+    # Bottom right
     cv2.line(image, (x2, y2), (x2 - w, y2), color, 3)
     cv2.line(image, (x2, y2), (x2, y2 - h), color, 3)
 
-    # Bottom left corner
+    # Bottom left
     cv2.line(image, (x1, y2), (x1 + w, y2), color, 3)
     cv2.line(image, (x1, y2), (x1, y2 - h), color, 3)
 
-    text = f'ID:{str(index)}'
-    cv2.putText(image, text,
-                (x1, y1 - 2),
-                0, 1 / 2, (0, 255, 0),
-                thickness=1, lineType=cv2.FILLED)
+    cv2.putText(image, f"ID:{index}", (x1, y1 - 2),
+                0, 0.7, (0, 250, 0), 2)
 
 
-def main():
-    size = 640
-    model = torch.load('./weights/v8_n.pt', map_location='cuda')['model'].float()
-    model.eval()
-    model.half()
-    reader = cv2.VideoCapture('./demo/demo.mp4')
+def main(input_video_path, output_video_path, weights_path):
 
-    # Check if camera opened successfully
+    print(f"\n📦 Loading YOLOv8 model: {weights_path}")
+    model = YOLO(weights_path)
+
+    reader = cv2.VideoCapture(input_video_path)
     if not reader.isOpened():
-        print("Error opening video stream or file")
-    fps = int(reader.get(cv2.CAP_PROP_FPS))
-    bytetrack = nn.BYTETracker(fps)
-    # Read until video is completed
-    while reader.isOpened():
-        # Capture frame-by-frame
-        success, frame = reader.read()
-        if success:
-            boxes = []
-            confidences = []
-            object_classes = []
+        print(f"❌ Error opening video: {input_video_path}")
+        return
 
-            image = frame.copy()
-            shape = image.shape[:2]
+    source_fps = int(reader.get(cv2.CAP_PROP_FPS))
+    width = int(reader.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(reader.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            r = size / max(shape[0], shape[1])
-            if r != 1:
-                h, w = shape
-                image = cv2.resize(image,
-                                   dsize=(int(w * r), int(h * r)),
-                                   interpolation=cv2.INTER_LINEAR)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_video_path, fourcc, source_fps, (width, height))
 
-            h, w = image.shape[:2]
-            image, ratio, pad = util.resize(image, size)
-            shapes = shape, ((h / shape[0], w / shape[1]), pad)
-            # Convert HWC to CHW, BGR to RGB
-            sample = image.transpose((2, 0, 1))[::-1]
-            sample = numpy.ascontiguousarray(sample)
-            sample = torch.unsqueeze(torch.from_numpy(sample), dim=0)
+    print(f"🎥 Processing: {input_video_path}")
+    print(f"💾 Writing output to: {output_video_path}")
 
-            sample = sample.cuda()
-            sample = sample.half()  # uint8 to fp16/32
-            sample = sample / 255  # 0 - 255 to 0.0 - 1.0
+    bytetrack = nn.BYTETracker(source_fps)
 
-            # Inference
-            with torch.no_grad():
-                outputs = model(sample)
+    frame_count = 0
+    total_time = 0
+    warmup_frames = 20
 
-            # NMS
-            outputs = util.non_max_suppression(outputs, 0.001, 0.7)
-            for i, output in enumerate(outputs):
-                detections = output.clone()
-                util.scale(detections[:, :4], sample[i].shape[1:], shapes[0], shapes[1])
-                detections = detections.cpu().numpy()
-                for detection in detections:
-                    x1, y1, x2, y2 = list(map(int, detection[:4]))
-                    boxes.append([x1, y1, x2, y2])
-                    confidences.append(detection[4])
-                    object_classes.append(detection[5])
-            outputs = bytetrack.update(numpy.array(boxes),
-                                       numpy.array(confidences),
-                                       numpy.array(object_classes))
-            if len(outputs) > 0:
-                boxes = outputs[:, :4]
-                identities = outputs[:, 4]
-                object_classes = outputs[:, 6]
-                for i, box in enumerate(boxes):
-                    if object_classes[i] != 0:  # 0 is for person class (COCO)
-                        continue
-                    x1, y1, x2, y2 = list(map(int, box))
-                    # get ID of object
-                    index = int(identities[i]) if identities is not None else 0
-
-                    draw_line(frame, x1, y1, x2, y2, index)
-            cv2.imshow('Frame', frame.astype('uint8'))
-            # Press Q on keyboard to  exit
-            if cv2.waitKey(25) & 0xFF == ord('q'):
-                break
-        # Break the loop
-        else:
+    while True:
+        ok, frame = reader.read()
+        if not ok:
             break
-    # When everything done, release the video capture object
+
+        t0 = time.time()
+        frame_count += 1
+
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # CRUCIAL: Give the tracker the frame for ReID crops
+        bytetrack.last_frame = frame
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+        # ----- YOLOv8 inference -----
+        results = model.predict(frame, verbose=False, half=True)[0]
+
+        if results.boxes is not None and len(results.boxes) > 0:
+            boxes = results.boxes.xyxy.cpu().numpy().astype(np.float32)
+            confs = results.boxes.conf.cpu().numpy().astype(np.float32)
+            classes = results.boxes.cls.cpu().numpy().astype(np.int32)
+
+            # Track with ReID-enhanced BYTETracker
+            outputs = bytetrack.update(boxes, confs, classes)
+
+            if len(outputs) > 0:
+                for det in outputs:
+                    x1, y1, x2, y2 = map(int, det[:4])
+                    track_id = int(det[4])
+                    cls_id = int(det[6])
+
+                    if cls_id == 0:   # person class only
+                        draw_line(frame, x1, y1, x2, y2, track_id)
+
+        t1 = time.time()
+
+        if frame_count > warmup_frames:
+            total_time += (t1 - t0)
+
+        if frame_count % 50 == 0:
+            avg_fps = (frame_count - warmup_frames) / max(1e-6, total_time)
+            print(f"  → Frame {frame_count} | Avg FPS: {avg_fps:.2f}")
+
+        writer.write(frame)
+
+    # ---- Final summary ----
     reader.release()
-    # Closes all the frames
-    cv2.destroyAllWindows()
+    writer.release()
+
+    useful_frames = max(0, frame_count - warmup_frames)
+    if useful_frames > 0:
+        final_fps = useful_frames / total_time
+        print(f"\n✅ Done! Total frames: {frame_count}")
+        print(f"⚡ Average Effective FPS: {final_fps:.2f}")
+    else:
+        print("\n⚠️ No frames processed after warmup.")
+
+    print(f"🎉 Output saved to: {output_video_path}\n")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_video", type=str, required=True)
+    parser.add_argument("--output_video", type=str, default="./output.mp4")
+    parser.add_argument("--weights", type=str, default="yolov8s.pt")
+    args = parser.parse_args()
+
+    main(args.input_video, args.output_video, args.weights)

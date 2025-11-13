@@ -4,6 +4,8 @@ import numpy
 import torch
 
 from utils import util
+# add near other imports
+from reid_model import ReIDModel
 
 
 def pad(k, p=None, d=1):
@@ -251,6 +253,9 @@ class Track:
         self.cls = cls
         self.idx = tlwh[-1]
 
+        # appearance feature (L2-normalized vector) for ReID
+        self.appearance = None
+
     def predict(self):
         mean_state = self.mean.copy()
         if self.state != State.Tracked:
@@ -297,6 +302,21 @@ class Track:
         self.cls = new_track.cls
         self.idx = new_track.idx
 
+    def update_feature(self, feat, alpha=0.1):
+        """Update running appearance feature with exponential moving average."""
+        if feat is None:
+            return
+        if self.appearance is None:
+            self.appearance = feat.astype('float32')
+        else:
+            # ema
+            self.appearance = (1.0 - alpha) * self.appearance + alpha * feat.astype('float32')
+            # renormalize
+            n = numpy.linalg.norm(self.appearance)
+            if n > 0:
+                self.appearance /= n
+
+
     def update(self, new_track, frame_id):
         """
         Update a matched track
@@ -316,6 +336,9 @@ class Track:
         self.score = new_track.score
         self.cls = new_track.cls
         self.idx = new_track.idx
+
+         # --- ADD THIS ---
+        self.update_feature(getattr(new_track, "appearance", None))
 
     def convert_coords(self, tlwh):
         return self.tlwh_to_xyah(tlwh)
@@ -393,23 +416,67 @@ class BYTETracker:
         self.removed_tracks = []
 
         self.frame_id = 0
-        self.max_time_lost = int(frame_rate)
+        self.max_time_lost = int(frame_rate*3)
         self.kalman_filter = util.KalmanFilterXYAH()
+        # ReID model (appearance extractor)
+        try:
+            self.reid = ReIDModel()
+        except Exception as e:
+            print("Warning: ReIDModel failed to initialize:", e)
+            self.reid = None
+
+        # last_frame will be set by main before update() so we can crop detection crops
+        self.last_frame = None
+
         self.reset_id()
 
+
     def update(self, boxes, scores, object_classes):
+        # How often to run ReID (1 = every frame, 2 = every 2nd frame, etc.)
+        REID_INTERVAL = 2
+
+        # advance frame counter first (frame_id starts from 0 when tracker created)
         self.frame_id += 1
+        use_reid = (self.frame_id % REID_INTERVAL == 0)
+
+        # prepare appearance list (one entry per incoming box)
+        appearance_feats = [None] * len(boxes)
+
+        # Only run ReID when configured and we have a frame and boxes
+        if use_reid and self.reid is not None and self.last_frame is not None and len(boxes) > 0:
+            # ensure object_classes is integer array for class checking
+            try:
+                cls_arr = object_classes.astype(int)
+            except Exception:
+                cls_arr = numpy.array([int(x) for x in object_classes])
+
+            # Only compute features for person class (cls == 0)
+            person_mask = (cls_arr == 0)
+            if numpy.any(person_mask):
+                # gather boxes for persons (xyxy)
+                person_boxes = boxes[person_mask][:, :4]
+                # batched extraction returns list aligned with provided person_boxes
+                person_feats = self.reid.extract_batch(self.last_frame, person_boxes)
+                # map back
+                pi = 0
+                for i in range(len(boxes)):
+                    if person_mask[i]:
+                        appearance_feats[i] = person_feats[pi]
+                        pi += 1
+            # non-person boxes keep None (no ReID)
+        # else: appearance_feats stay all None
+
         activated_tracks = []
         re_find_tracks = []
         lost_tracks = []
         removed_tracks = []
 
-        # add index
+        # add index (preserve original ordering so appearance_feats align)
         boxes = numpy.concatenate([boxes, numpy.arange(len(boxes)).reshape(-1, 1)], axis=-1)
 
         indices_low = scores > 0.1
-        indices_high = scores < 0.5
-        indices_remain = scores > 0.5
+        indices_high = scores < 0.45
+        indices_remain = scores > 0.45
 
         indices_second = numpy.logical_and(indices_low, indices_high)
         boxes_second = boxes[indices_second]
@@ -419,7 +486,16 @@ class BYTETracker:
         cls_keep = object_classes[indices_remain]
         cls_second = object_classes[indices_second]
 
+        # indices arrays -> integer positions (for mapping appearance_feats)
+        idxs_remain = numpy.where(indices_remain)[0]
+        idxs_second = numpy.where(indices_second)[0]
+
         detections = self.init_track(boxes, scores_keep, cls_keep)
+        # attach appearance to detections (for later matching)
+        for j, det in enumerate(detections):
+            ridx = idxs_remain[j]
+            det.appearance = appearance_feats[ridx] if ridx < len(appearance_feats) else None
+
         """ Add newly detected tracklets to tracked_stracks"""
         unconfirmed = []
         tracked_stracks = []
@@ -434,30 +510,42 @@ class BYTETracker:
         self.multi_predict(track_pool)
 
         dists = self.get_dists(track_pool, detections)
-        matches, u_track, u_detection = util.linear_assignment(dists, thresh=0.8)
+        matches, u_track, u_detection = util.linear_assignment(dists, thresh=0.65)
         for tracked_i, box_i in matches:
             track = track_pool[tracked_i]
             det = detections[box_i]
             if track.state == State.Tracked:
                 track.update(det, self.frame_id)
+                # update appearance after match
+                track.update_feature(det.appearance)
                 activated_tracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
+                # update appearance after re-activate
+                track.update_feature(det.appearance)
                 re_find_tracks.append(track)
         """ Step 3: Second association, with low score detection boxes"""
         # association the untrack to the low score detections
         detections_second = self.init_track(boxes_second, scores_second, cls_second)
+
+        for j, det in enumerate(detections_second):
+            ridx = idxs_second[j]
+            det.appearance = appearance_feats[ridx] if ridx < len(appearance_feats) else None
+
         r_tracked_tracks = [track_pool[i] for i in u_track if track_pool[i].state == State.Tracked]
-        dists = util.iou_distance(r_tracked_tracks, detections_second)
-        matches, u_track, u_detection_second = util.linear_assignment(dists, thresh=0.5)
+        # use fused distances (ioU + appearance) here as well
+        dists = self.get_dists(r_tracked_tracks, detections_second)
+        matches, u_track, u_detection_second = util.linear_assignment(dists, thresh=0.55)
         for tracked_i, box_i in matches:
             track = r_tracked_tracks[tracked_i]
             det = detections_second[box_i]
             if track.state == State.Tracked:
                 track.update(det, self.frame_id)
+                track.update_feature(det.appearance)
                 activated_tracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
+                track.update_feature(det.appearance)
                 re_find_tracks.append(track)
 
         for it in u_track:
@@ -468,9 +556,11 @@ class BYTETracker:
         """Deal with unconfirmed tracks, usually tracks with only one beginning frame"""
         detections = [detections[i] for i in u_detection]
         dists = self.get_dists(unconfirmed, detections)
-        matches, u_unconfirmed, u_detection = util.linear_assignment(dists, thresh=0.7)
+        matches, u_unconfirmed, u_detection = util.linear_assignment(dists, thresh=0.75)
         for tracked_i, box_i in matches:
             unconfirmed[tracked_i].update(detections[box_i], self.frame_id)
+            # update appearance
+            unconfirmed[tracked_i].update_feature(detections[box_i].appearance)
             activated_tracks.append(unconfirmed[tracked_i])
         for it in u_unconfirmed:
             track = unconfirmed[it]
@@ -479,9 +569,11 @@ class BYTETracker:
         """ Step 4: Init new stracks"""
         for new_i in u_detection:
             track = detections[new_i]
-            if track.score < 0.6:
+            if track.score < 0.5:
                 continue
             track.activate(self.kalman_filter, self.frame_id)
+            # set initial appearance if available
+            track.update_feature(track.appearance)
             activated_tracks.append(track)
         """ Step 5: Update state"""
         for track in self.lost_tracks:
@@ -498,20 +590,44 @@ class BYTETracker:
         self.removed_tracks.extend(removed_tracks)
         self.tracked_tracks, self.lost_tracks = self.remove_duplicate_stracks(self.tracked_tracks, self.lost_tracks)
         output = [track.tlbr.tolist() + [track.track_id,
-                                         track.score,
-                                         track.cls,
-                                         track.idx] for track in self.tracked_tracks if track.is_activated]
+                                        track.score,
+                                        track.cls,
+                                        track.idx] for track in self.tracked_tracks if track.is_activated]
         return numpy.asarray(output, dtype=numpy.float32)
+
+
+
 
     @staticmethod
     def init_track(boxes, scores, cls):
         return [Track(box, s, c) for (box, s, c) in zip(boxes, scores, cls)] if len(boxes) else []  # detections
 
     @staticmethod
-    def get_dists(tracks, detections):
-        dists = util.iou_distance(tracks, detections)
-        dists = util.fuse_score(dists, detections)
+    def get_dists(tracks, detections, lambda_appear=0.4):
+        # IOU distance (0..1)
+        iou_d = util.iou_distance(tracks, detections)
+        # fuse score as before (keeps detection scoring influence)
+        iou_d = util.fuse_score(iou_d, detections)
+
+        # appearance distance: 1 - cosine similarity (0..2), clamp to [0,1]
+        app_d = numpy.ones_like(iou_d, dtype=numpy.float32)
+        for i, t in enumerate(tracks):
+            for j, d in enumerate(detections):
+                ta = getattr(t, "appearance", None)
+                da = getattr(d, "appearance", None)
+                if ta is None or da is None:
+                    app_d[i, j] = 1.0
+                else:
+                    dot = numpy.dot(ta, da)
+                    denom = (numpy.linalg.norm(ta) * numpy.linalg.norm(da) + 1e-6)
+                    cos = dot / denom
+                    # convert to distance in [0,1]
+                    app_d[i, j] = max(0.0, min(1.0, 1.0 - cos))
+
+        # weighted combination: lower is better (same scale as iou_d)
+        dists = (1.0 - lambda_appear) * iou_d + lambda_appear * app_d
         return dists
+
 
     @staticmethod
     def multi_predict(tracks):
